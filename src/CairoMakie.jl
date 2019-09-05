@@ -9,7 +9,7 @@ using AbstractPlotting: to_value, to_colormap, extrema_nan
 using FileIO, StaticArrays
 using LinearAlgebra
 import Cairo
-using Cairo: CairoContext, CairoARGBSurface, CairoSVGSurface
+using Cairo: CairoContext, CairoARGBSurface, CairoSVGSurface, CairoPDFSurface
 
 @enum RenderType SVG PNG PDF
 
