@@ -6,8 +6,10 @@ using AbstractPlotting: convert_attribute, @extractvalue, LineSegments, to_ndim,
 using AbstractPlotting: @info, @get_attribute, Combined
 using Colors, GeometryTypes
 using AbstractPlotting: to_value, to_colormap, extrema_nan
-using Cairo, FileIO
+using FileIO, StaticArrays
 using LinearAlgebra
+import Cairo
+using Cairo: CairoContext, CairoARGBSurface, CairoSVGSurface
 
 @enum RenderType SVG PNG PDF
 
@@ -37,7 +39,7 @@ function CairoBackend(path::String)
     CairoBackend(typ, path)
 end
 
-struct CairoScreen{S}
+struct CairoScreen{S} <: AbstractPlotting.AbstractScreen
     scene::Scene
     surface::S
     context::CairoContext
@@ -46,7 +48,7 @@ end
 # # we render the scene directly, since we have no screen dependant state like in e.g. opengl
 Base.insert!(screen::CairoScreen, scene::Scene, plot) = nothing
 
-# Default to Gtk Window+Canvas as backing device
+# Default to Window+Canvas as backing device
 function CairoScreen(scene::Scene)
     w, h = size(scene)
     surf = CairoRGBSurface(w, h)
@@ -172,6 +174,14 @@ end
 function color2tuple3(c)
     (red(c), green(c), blue(c))
 end
+function colorant2tuple4(c)
+    (red(c), green(c), blue(c), alpha(c))
+end
+
+mesh_pattern_set_corner_color(pattern, id, c::Color3) =
+    Cairo.mesh_pattern_set_corner_color_rgb(pattern, id, color2tuple3(c)...)
+mesh_pattern_set_corner_color(pattern, id, c::Colorant{T,4} where T) =
+    Cairo.mesh_pattern_set_corner_color_rgba(pattern, id, colorant2tuple4(c)...)
 
 function draw_atomic(scene::Scene, screen::CairoScreen, primitive::Mesh)
     @get_attribute(primitive, (color,))
@@ -193,9 +203,9 @@ function draw_atomic(scene::Scene, screen::CairoScreen, primitive::Mesh)
         Cairo.mesh_pattern_line_to(pattern, t2...)
         Cairo.mesh_pattern_line_to(pattern, t3...)
 
-        Cairo.mesh_pattern_set_corner_color_rgb(pattern, 0, color2tuple3(c1)...)
-        Cairo.mesh_pattern_set_corner_color_rgb(pattern, 1, color2tuple3(c2)...)
-        Cairo.mesh_pattern_set_corner_color_rgb(pattern, 2, color2tuple3(c3)...)
+        mesh_pattern_set_corner_color(pattern, 0, c1)
+        mesh_pattern_set_corner_color(pattern, 1, c2)
+        mesh_pattern_set_corner_color(pattern, 2, c3)
 
         Cairo.mesh_pattern_end_patch(pattern)
 
@@ -252,12 +262,15 @@ function draw_image(scene, screen, attributes)
     w, h = xymax .- xy
     interp = to_value(get(attributes, :interpolate, true))
     interp = interp ? Cairo.FILTER_BEST : Cairo.FILTER_NEAREST
-    Cairo.save(ctx);
-    pattern = Cairo.CairoPattern(to_cairo_image(image, attributes))
-    Cairo.pattern_set_extend(pattern, Cairo.EXTEND_PAD)
-    Cairo.pattern_set_filter(pattern, interp)
-    Cairo.set_source(ctx, pattern)
+    s = to_cairo_image(image, attributes)
     Cairo.rectangle(ctx, xy..., w, h)
+    Cairo.save(ctx)
+    Cairo.translate(ctx, xy...)
+    Cairo.scale(ctx, w/s.width, h/s.height)
+    Cairo.set_source_surface(ctx, s, 0, 0)
+    p = Cairo.get_source(ctx)
+    # Set filter doesn't work!?
+    Cairo.pattern_set_filter(p, interp)
     Cairo.fill(ctx)
     Cairo.restore(ctx)
 end
@@ -379,6 +392,54 @@ function to_rel_scale(atlas, c, font, scale)
     (scale ./ 0.02) ./ gs
 end
 
+function calc_position(
+        last_pos, start_pos,
+        atlas, glyph, font,
+        scale, lineheight = 1.5
+    )
+    advance_x, advance_y = AbstractPlotting.glyph_advance!(atlas, glyph, font, scale)
+    if AbstractPlotting.isnewline(glyph)
+        return Point2f0(start_pos[1], last_pos[2] - advance_y * lineheight) #reset to startx
+    else
+        return last_pos + Point2f0(advance_x, 0)
+    end
+end
+
+function calc_position(glyphs, start_pos, scales, fonts, atlas)
+    positions = zeros(Point2f0, length(glyphs))
+    last_pos  = Point2f0(start_pos)
+    s, f = AbstractPlotting.iter_or_array(scales), AbstractPlotting.iter_or_array(fonts)
+    c1 = first(glyphs)
+    for (i, (c2, scale, font)) in enumerate(zip(glyphs, s, f))
+        c2 == '\r' && continue # stupid windows!
+        positions[i] = last_pos
+        last_pos = calc_position(last_pos, start_pos, atlas, c2, font, scale)
+    end
+    positions
+end
+function layout_text(
+        string::AbstractString, startpos::VecTypes{N, T}, textsize::Number,
+        font, align, rotation, model
+    ) where {N, T}
+    offset_vec = to_align(align)
+    ft_font = to_font(font)
+    rscale = to_textsize(textsize)
+    rot = to_rotation(rotation)
+    atlas = AbstractPlotting.get_texture_atlas()
+    mpos = model * Vec4f0(to_ndim(Vec3f0, startpos, 0f0)..., 1f0)
+    pos = AbstractPlotting.to_ndim(Point3f0, mpos, 0)
+    scales = Vec2f0[AbstractPlotting.glyph_scale!(atlas, c, ft_font, rscale) for c in string]
+    positions2d = calc_position(string, Point2f0(0), rscale, ft_font, atlas)
+    aoffset = AbstractPlotting.align_offset(Point2f0(0), positions2d[end], atlas, rscale, ft_font, offset_vec)
+    aoffsetn = AbstractPlotting.to_ndim(Point3f0, aoffset, 0f0)
+    positions = map(positions2d) do p
+        pn = rot * (AbstractPlotting.to_ndim(Point3f0, p, 0f0) .+ aoffsetn)
+        pn .+ (pos)
+    end
+    positions, scales
+end
+
+
 function draw_atomic(scene::Scene, screen::CairoScreen, primitive::Text)
     ctx = screen.context
     @get_attribute(primitive, (textsize, color, font, align, rotation, model))
@@ -386,13 +447,17 @@ function draw_atomic(scene::Scene, screen::CairoScreen, primitive::Text)
     position = primitive.attributes[:position][]
     N = length(txt)
     atlas = AbstractPlotting.get_texture_atlas()
+    if position isa StaticArrays.StaticArray # one position to place text
+        position, textsize = layout_text(
+            txt, position, textsize,
+            font, align, rotation, model
+        )
+    end
     broadcast_foreach(1:N, position, textsize, color, font, rotation) do i, p, ts, cc, f, r
         Cairo.save(ctx)
-        char = N == length(position) ? txt[i] : first(txt)
+        char = txt[i]
         rels = to_rel_scale(atlas, char, f, ts)
-        b = AbstractPlotting.glyph_bearing!(atlas, char, f, rels)
-        p2 = to_ndim(Point{length(p), Float32}, b, 0f0)
-        pos = project_position(scene, p, model)
+        pos = project_position(scene, p, Mat4f0(I))
         Cairo.move_to(ctx, pos[1], pos[2])
         Cairo.set_source_rgba(ctx, red(cc), green(cc), blue(cc), alpha(cc))
         Cairo.select_font_face(
@@ -406,12 +471,8 @@ function draw_atomic(scene::Scene, screen::CairoScreen, primitive::Text)
         set_font_matrix(ctx, mat)
         # set_font_size(ctx, 16)
         # TODO this only works in 2d
-        rotate(ctx, 2acos(r[4]))
-        if N == length(position) # if one position per glyph
-            Cairo.show_text(ctx, string(txt[i]))
-        else
-            Cairo.show_text(ctx, txt)
-        end
+        Cairo.rotate(ctx, 2acos(r[4]))
+        Cairo.show_text(ctx, string(txt[i]))
         Cairo.restore(ctx)
     end
     nothing
@@ -429,7 +490,7 @@ end
 function draw_background(screen::CairoScreen, scene::Scene)
     cr = screen.context
     Cairo.save(cr)
-    if theme(scene, :clear)[]
+    if scene.clear[]
         bg = to_color(theme(scene, :backgroundcolor)[])
         Cairo.set_source_rgba(cr, red(bg), green(bg), blue(bg), alpha(bg));    # light gray
         r = pixelarea(scene)[]
@@ -469,20 +530,17 @@ function cairo_draw(screen::CairoScreen, scene::Scene)
 end
 
 function AbstractPlotting.backend_display(x::CairoBackend, scene::Scene)
-    open(x.path, "w") do io
+    return open(x.path, "w") do io
         AbstractPlotting.backend_show(x, io, to_mime(x), scene)
     end
-    (x, scene)
 end
 
-function AbstractPlotting.colorbuffer(tup::Tuple{<: CairoBackend, Scene})
-    screen, scene = tup
+function AbstractPlotting.colorbuffer(screen::CairoScreen)
     # TODO this is super slow, we need to design the colorbuffer
     # api to be able to reuse a RGB surface
-    AbstractPlotting.backend_display(screen, scene)
-    FileIO.load(screen.path)
+    FileIO.save(display_path("png"), screen.scene)
+    return FileIO.load(display_path("png"))
 end
-
 
 AbstractPlotting.backend_showable(x::CairoBackend, m::MIME"image/svg+xml", scene::Scene) = x.typ == SVG
 AbstractPlotting.backend_showable(x::CairoBackend, m::MIME"application/pdf", scene::Scene) = x.typ == PDF
@@ -493,7 +551,7 @@ function AbstractPlotting.backend_show(x::CairoBackend, io::IO, ::MIME"image/svg
     screen = CairoScreen(scene, io)
     cairo_draw(screen, scene)
     Cairo.finish(screen.surface)
-    (x, scene)
+    return screen
 end
 
 function AbstractPlotting.backend_show(x::CairoBackend, io::IO, ::MIME"application/pdf", scene::Scene)
@@ -506,21 +564,34 @@ end
 function AbstractPlotting.backend_show(x::CairoBackend, io::IO, m::MIME"image/png", scene::Scene)
     screen = CairoScreen(scene, io)
     cairo_draw(screen, scene)
-    write_to_png(screen.surface, io)
-    (x, scene)
+    Cairo.write_to_png(screen.surface, io)
+    return screen
+end
+
+function AbstractPlotting.backend_show(x::CairoBackend, io::IO, m::MIME"image/jpeg", scene::Scene)
+    screen = nothing
+    open(display_path("png"), "w") do fio
+        screen = AbstractPlotting.backend_show(x, fio, MIME"image/png"(), scene)
+    end
+    FileIO.save(FileIO.Stream(format"JPEG", io),  FileIO.load(display_path("png")))
+    return screen
 end
 
 function __init__()
-    dir = mktempdir()
-    temp_file = joinpath(dir, "cairo.svg")
-    AbstractPlotting.register_backend!(CairoBackend(temp_file))
-    atexit() do
-        rm(dir, force = true, recursive = true)
-    end
+    activate!()
+    AbstractPlotting.register_backend!(AbstractPlotting.current_backend[])
 end
 
-function activate!(inline = false)
-    AbstractPlotting.current_backend[] = CairoBackend()
+function display_path(type::String)
+    if !(type in ("svg", "png"))
+        error("Only \"svg\" and \"png\" are allowed for `type`. Found: $(type)")
+    end
+    return joinpath(@__DIR__, "display." * type)
+end
+
+function activate!(; inline = true, type = "svg")
+
+    AbstractPlotting.current_backend[] = CairoBackend(display_path(type))
     AbstractPlotting.use_display[] = !inline
     return
 end
